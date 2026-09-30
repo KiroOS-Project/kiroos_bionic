@@ -209,6 +209,23 @@ int pthread_cond_timedwait(pthread_cond_t *cond_interface, pthread_mutex_t * mut
   return __pthread_cond_timedwait(cond, mutex, cond->use_realtime_clock(), abstime);
 }
 
+// KiroOS: Android 11's pthread_cond_clockwait (version LIBC_R), which apps built for newer
+// Android call directly - libc++'s condition_variable on a steady clock, e.g. Geekbench, whose
+// native library then failed to load. The same futex wait, on the clock the caller names.
+extern "C" int pthread_cond_clockwait(pthread_cond_t* cond_interface, pthread_mutex_t* mutex,
+                                      clockid_t clock, const timespec* abs_timeout) {
+  switch (clock) {
+    case CLOCK_MONOTONIC:
+      return __pthread_cond_timedwait(__get_internal_cond(cond_interface), mutex, false,
+                                      abs_timeout);
+    case CLOCK_REALTIME:
+      return __pthread_cond_timedwait(__get_internal_cond(cond_interface), mutex, true,
+                                      abs_timeout);
+    default:
+      return EINVAL;
+  }
+}
+
 #if !defined(__LP64__)
 // TODO: this exists only for backward binary compatibility on 32 bit platforms.
 extern "C" int pthread_cond_timedwait_monotonic(pthread_cond_t* cond_interface,

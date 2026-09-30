@@ -1251,6 +1251,11 @@ LIBC_N {
     tmpfile64;
 } LIBC;
 
+LIBC_R {
+  global:
+    pthread_cond_clockwait;
+} LIBC_N;
+
 LIBC_PRIVATE {
   global:
     __accept4; # arm x86 mips

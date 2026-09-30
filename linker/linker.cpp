@@ -2801,6 +2801,157 @@ bool soinfo::lookup_version_info(const VersionTracker& version_tracker, ElfW(Wor
   return true;
 }
 
+// KiroOS: dynamic tags of packed relative relocations (Android 9+ uses the DT_ANDROID_RELR
+// ones, Android 11+ the standard DT_RELR ones; the format is the same)
+#define KIRO_DT_RELRSZ 35
+#define KIRO_DT_RELR 36
+#define KIRO_DT_RELRENT 37
+#define KIRO_DT_ANDROID_RELR 0x6fffe000
+#define KIRO_DT_ANDROID_RELRSZ 0x6fffe001
+#define KIRO_DT_ANDROID_RELRENT 0x6fffe003
+
+// KiroOS: applies packed relative relocations. An even entry is the offset of one relocation
+// and moves the base just after it; an odd entry is a bitmap of the 63 (31 on 32-bit) words
+// that follow the base, then the base moves past them.
+static void kiro_relocate_relr(const ElfW(Addr)* relr, size_t count, ElfW(Addr) load_bias) {
+  constexpr size_t kWordSize = sizeof(ElfW(Addr));
+  ElfW(Addr) base = 0;
+  for (size_t i = 0; i < count; ++i) {
+    ElfW(Addr) entry = relr[i];
+    if ((entry & 1) == 0) {
+      *reinterpret_cast<ElfW(Addr)*>(load_bias + entry) += load_bias;
+      base = entry + kWordSize;
+      continue;
+    }
+    ElfW(Addr) offset = base;
+    while (entry != 0) {
+      entry >>= 1;
+      if ((entry & 1) != 0) {
+        *reinterpret_cast<ElfW(Addr)*>(load_bias + offset) += load_bias;
+      }
+      offset += kWordSize;
+    }
+    base += (8 * kWordSize - 1) * kWordSize;
+  }
+}
+
+#if defined(__aarch64__)
+// KiroOS: dynamic ELF TLS for R_AARCH64_TLSDESC (Android 10+ has it built into bionic). Each
+// library with a PT_TLS segment gets a pthread key of libc.so - not of the linker's own libc
+// copy, whose key bookkeeping is separate - holding this thread's copy of the segment: made
+// from the init image on first use, freed with the thread.
+struct KiroTlsModule {
+  const void* init_image;
+  size_t init_size;
+  size_t size;
+  size_t align;
+  pthread_key_t key;
+  void* (*getspecific)(pthread_key_t);
+  int (*setspecific)(pthread_key_t, const void*);
+  int (*memalign)(void**, size_t, size_t);
+};
+
+struct KiroTlsArg {
+  KiroTlsModule* module;
+  ElfW(Addr) offset;
+};
+
+// arch/arm64/kiro_tlsdesc.S: calls kiro_tls_get_addr keeping every register but x0
+extern "C" ElfW(Addr) kiro_tlsdesc_resolver(void* descriptor);
+
+extern "C" void* kiro_tls_get_addr(const KiroTlsArg* arg) {
+  KiroTlsModule* m = arg->module;
+  void* block = m->getspecific(m->key);
+  if (block == nullptr) {
+    if (m->memalign(&block, m->align, m->size) != 0 || block == nullptr) {
+      __libc_fatal("KiroOS linker: no memory for a thread's TLS block");
+    }
+    memcpy(block, m->init_image, m->init_size);
+    memset(static_cast<char*>(block) + m->init_size, 0, m->size - m->init_size);
+    m->setspecific(m->key, block);
+  }
+  return static_cast<char*>(block) + arg->offset;
+}
+
+static void* kiro_libc_symbol(const char* name) {
+  for (soinfo* si = solist; si != nullptr; si = si->next) {
+    const char* soname = si->get_soname();
+    if (soname != nullptr && strcmp(soname, "libc.so") == 0) {
+      SymbolName symbol_name(name);
+      const ElfW(Sym)* sym = nullptr;
+      if (si->find_symbol_by_name(symbol_name, nullptr, &sym) && sym != nullptr) {
+        return reinterpret_cast<void*>(si->resolve_symbol_address(sym));
+      }
+      return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+static KiroTlsModule* kiro_tls_module(soinfo* si) {
+  if (si->get_kiro_tls() != nullptr) {
+    return si->get_kiro_tls();
+  }
+  const ElfW(Phdr)* tls = nullptr;
+  for (size_t i = 0; i < si->phnum; ++i) {
+    if (si->phdr[i].p_type == PT_TLS) {
+      tls = &si->phdr[i];
+      break;
+    }
+  }
+  if (tls == nullptr) {
+    DL_ERR("\"%s\" has TLS relocations but no TLS segment", si->get_realpath());
+    return nullptr;
+  }
+  typedef int (*key_create_t)(pthread_key_t*, void (*)(void*));
+  typedef void (*free_t)(void*);
+  key_create_t key_create = reinterpret_cast<key_create_t>(kiro_libc_symbol("pthread_key_create"));
+  free_t free_fn = reinterpret_cast<free_t>(kiro_libc_symbol("free"));
+  KiroTlsModule* m = new KiroTlsModule();
+  m->getspecific = reinterpret_cast<void* (*)(pthread_key_t)>(
+      kiro_libc_symbol("pthread_getspecific"));
+  m->setspecific = reinterpret_cast<int (*)(pthread_key_t, const void*)>(
+      kiro_libc_symbol("pthread_setspecific"));
+  m->memalign = reinterpret_cast<int (*)(void**, size_t, size_t)>(
+      kiro_libc_symbol("posix_memalign"));
+  if (key_create == nullptr || free_fn == nullptr || m->getspecific == nullptr ||
+      m->setspecific == nullptr || m->memalign == nullptr) {
+    DL_ERR("TLS of \"%s\": libc.so functions not found", si->get_realpath());
+    delete m;
+    return nullptr;
+  }
+  m->init_image = reinterpret_cast<const void*>(si->load_bias + tls->p_vaddr);
+  m->init_size = tls->p_filesz;
+  m->size = tls->p_memsz > sizeof(void*) ? tls->p_memsz : sizeof(void*);
+  m->align = tls->p_align > sizeof(void*) ? tls->p_align : sizeof(void*);
+  if (key_create(&m->key, free_fn) != 0) {
+    DL_ERR("TLS of \"%s\": no pthread key left", si->get_realpath());
+    delete m;
+    return nullptr;
+  }
+  si->set_kiro_tls(m);
+  return m;
+}
+
+static bool kiro_tlsdesc_relocate(soinfo* si, ElfW(Addr) reloc, ElfW(Addr) offset) {
+  if (si == nullptr) {
+    DL_ERR("TLS relocation against an undefined symbol");
+    return false;
+  }
+  KiroTlsModule* m = kiro_tls_module(si);
+  if (m == nullptr) {
+    return false;
+  }
+  KiroTlsArg* arg = new KiroTlsArg();
+  arg->module = m;
+  arg->offset = offset;
+  ElfW(Addr)* descriptor = reinterpret_cast<ElfW(Addr)*>(reloc);
+  descriptor[0] = reinterpret_cast<ElfW(Addr)>(kiro_tlsdesc_resolver);
+  descriptor[1] = reinterpret_cast<ElfW(Addr)>(arg);
+  return true;
+}
+#endif  // __aarch64__
+
 #if !defined(__mips__)
 #if defined(USE_RELA)
 static ElfW(Addr) get_addend(ElfW(Rela)* rela, ElfW(Addr) reloc_addr __unused) {
@@ -3104,8 +3255,14 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
                    reloc, (sym_addr + addend), rel->r_offset);
         break;
       case R_AARCH64_TLS_DTPREL32:
-        TRACE_TYPE(RELO, "RELO TLS_DTPREL32 *** %16llx <- %16llx - %16llx\n",
-                   reloc, (sym_addr + addend), rel->r_offset);
+        // KiroOS: 1031 is R_AARCH64_TLSDESC (this header gives it the wrong name, and the
+        // relocation used to be skipped): the dynamic ELF TLS of NDK code for Android 10+.
+        // The variable lives in the TLS block of the library that defines it.
+        TRACE_TYPE(RELO, "RELO TLSDESC %16llx <- %16llx\n", reloc, addend);
+        if (!kiro_tlsdesc_relocate(sym == 0 ? this : lsi, reloc,
+                                   addend + (sym == 0 ? 0 : s->st_value))) {
+          return false;
+        }
         break;
 #elif defined(__x86_64__)
       case R_X86_64_32:
@@ -3763,6 +3920,26 @@ bool soinfo::prelink_image() {
         android_relocs_size_ = d->d_un.d_val;
         break;
 
+      // KiroOS: packed relative relocations (Android 9+ tags and the standard ones of 11+)
+      case KIRO_DT_ANDROID_RELR:
+      case KIRO_DT_RELR:
+        relr_ = reinterpret_cast<ElfW(Addr)*>(load_bias + d->d_un.d_ptr);
+        break;
+
+      case KIRO_DT_ANDROID_RELRSZ:
+      case KIRO_DT_RELRSZ:
+        relr_count_ = d->d_un.d_val / sizeof(ElfW(Addr));
+        break;
+
+      case KIRO_DT_ANDROID_RELRENT:
+      case KIRO_DT_RELRENT:
+        if (d->d_un.d_val != sizeof(ElfW(Addr))) {
+          DL_ERR("invalid DT_RELRENT %zu in \"%s\"", static_cast<size_t>(d->d_un.d_val),
+                 get_realpath());
+          return false;
+        }
+        break;
+
       case DT_ANDROID_REL:
         DL_ERR("unsupported DT_ANDROID_REL in \"%s\"", get_realpath());
         return false;
@@ -4086,6 +4263,11 @@ bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t& 
     }
   }
 #endif
+
+  if (relr_ != nullptr) {
+    DEBUG("[ relr relocating %s ]", get_realpath());
+    kiro_relocate_relr(relr_, relr_count_, load_bias);
+  }
 
   if (android_relocs_ != nullptr) {
     // check signature

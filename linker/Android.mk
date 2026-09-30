@@ -21,7 +21,7 @@ LOCAL_SRC_FILES := \
     rt.cpp \
 
 LOCAL_SRC_FILES_arm     := arch/arm/begin.S
-LOCAL_SRC_FILES_arm64   := arch/arm64/begin.S
+LOCAL_SRC_FILES_arm64   := arch/arm64/begin.S arch/arm64/kiro_tlsdesc.S
 LOCAL_SRC_FILES_x86     := arch/x86/begin.c
 LOCAL_SRC_FILES_x86_64  := arch/x86_64/begin.S
 LOCAL_SRC_FILES_mips    := arch/mips/begin.S linker_mips.cpp

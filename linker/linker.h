@@ -344,6 +344,10 @@ struct soinfo {
 
   void set_soname(const char* soname);
   const char* get_soname() const;
+
+  // KiroOS: this library's dynamic ELF TLS (linker.cpp), null until its first TLS relocation
+  struct KiroTlsModule* get_kiro_tls() const { return kiro_tls_; }
+  void set_kiro_tls(struct KiroTlsModule* tls) { kiro_tls_ = tls; }
   const char* get_realpath() const;
   const ElfW(Versym)* get_versym(size_t n) const;
   ElfW(Addr) get_verneed_ptr() const;
@@ -433,6 +437,13 @@ struct soinfo {
   android_namespace_t* primary_namespace_;
   android_namespace_list_t secondary_namespaces_;
   uintptr_t handle_;
+
+  // KiroOS: libraries built for Android 10+ (NDK code of newer apps): packed relative
+  // relocations (DT_RELR / DT_ANDROID_RELR) and dynamic ELF TLS (R_AARCH64_TLSDESC).
+  // Zero for every other library (the constructor clears the whole soinfo).
+  ElfW(Addr)* relr_;
+  size_t relr_count_;
+  struct KiroTlsModule* kiro_tls_;
 
   friend soinfo* get_libdl_info();
 };
